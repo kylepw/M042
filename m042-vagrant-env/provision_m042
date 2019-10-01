@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+#
+# Bash script for provisioning the MongoDB instances
+
+set -e
+set -x
+
+function ip_config(){
+  export CLIENT_IP_ADDR=`ifconfig  | grep 'inet addr:'| grep -v '127.0.0.1' | cut -d: -f2 | awk '{ print $1}' | tail -1`
+  export CLIENT_FQDN=`hostname`
+  export CLIENT_NAME=`hostname | cut -d. -f 1 | tr '[:upper:]' '[:lower:]'`
+  echo "Configuring /etc/hosts ..."
+  echo "127.0.0.1 localhost localhost.localdomain localhost4 localhost4.localdomain4 " > /etc/hosts
+  echo "::1       localhost localhost.localdomain localhost6 localhost6.localdomain6" >> /etc/hosts
+  echo "fe00::0 ip6-localnet" >> /etc/hosts
+  echo "ff00::0 ip6-mcastprefix" >> /etc/hosts
+  echo "ff02::1 ip6-allnodes" >> /etc/hosts
+  echo "ff02::2 ip6-allrouters" >> /etc/hosts
+  echo "ff02::3 ip6-allhosts" >> /etc/hosts
+  echo "$CLIENT_IP_ADDR    $CLIENT_FQDN $CLIENT_NAME" >> /etc/hosts
+}
+
+function install_mongod(){
+ sudo echo "
+[mongodb-enterprise]
+name=MongoDB Enterprise Repository
+baseurl=https://repo.mongodb.com/yum/redhat/7/mongodb-enterprise/4.1/x86_64/
+gpgcheck=1
+enabled=1
+gpgkey=https://www.mongodb.org/static/pgp/server-4.2.asc
+  " >> /etc/yum.repos.d/mongodb-enterprise.repo
+  sudo yum install -y mongodb-enterprise-unstable
+
+}
+
+function user_setup(){
+  sudo mkdir -p /data/db
+  sudo chown vagrant:vagrant /data/db
+  sudo sh -c "killall mongod; true"
+  sudo mkdir -p /var/mongodb/db/{db1,db2,db3}
+  sudo mkdir -p /var/mongodb/logs
+  sudo mkdir -p /var/mongodb/certs
+  sudo chown -R vagrant:vagrant /var/mongodb
+  sudo mkdir -p /downloads/
+  echo "Set LC_ALL=C to .profile"
+  sudo echo "export LC_ALL=C" >> /home/vagrant/.profile
+  sudo echo "function get_certificate_password() {
+echo -n 'm042password'
+}
+
+export -f get_certificate_password
+" >> /home/vagrant/.bash_profile
+}
+
+
+function fatal() {
+  echo ERROR
+  echo "$1"
+  exit 1
+}
+
+
+function verify_ip() {
+  if [ $(ip address show lo | awk '/inet /{print substr($2,0)}' | awk -F "/" '{print $1}') != "127.0.0.1" ]
+  then
+    fatal "Cannot proceed: localhost ip address different from expected 127.0.0.1 - please reload your vagrant box"
+  fi
+}
+
+function generate_certs() {
+  sudo rm -rf /x509
+  sudo mkdir -p /x509
+  mkdir /x509/certs /x509/crl /x509/csr /x509/newcerts /x509/private
+  # sudo chown vagrant:vagrant -R /x509
+  chmod 700 /x509/private
+  touch /x509/index.txt
+  echo 1000 > /x509/serial
+  echo 1000 > /x509/crlnumber
+
+  # retrieve certs/private key
+  curl -s https://s3.amazonaws.com/university-courses/m042/ROOT_EDUCATION.pem -o /x509/certs/ROOT_EDUCATION.pem
+  curl -s https://s3.amazonaws.com/university-courses/m042/UNIVERSITY_CA.pem -o /x509/certs/UNIVERSITY_CA.pem
+  curl -s https://s3.amazonaws.com/university-courses/m042/M042_CA.pem -o /x509/certs/M042_CA.pem
+  curl -s https://s3.amazonaws.com/university-courses/m042/M042_CA.key -o /x509/private/M042_CA.key
+
+  # retrieve SSL config file
+  curl -s https://s3.amazonaws.com/university-courses/m042/ca-m042-config.txt -o /x509/openssl.cnf
+
+  # set up X.509 keychain
+  echo "" >> /x509/certs/M042_CA.pem
+  cat /x509/certs/UNIVERSITY_CA.pem >> \
+      /x509/certs/M042_CA.pem
+  echo "" >> /x509/certs/M042_CA.pem
+  cat /x509/certs/ROOT_EDUCATION.pem >> \
+      /x509/certs/M042_CA.pem
+
+  # create server private key
+  openssl genrsa -aes256 -passout pass:m042password -out /x509/private/m042.server.key 2048
+  chmod 400 /x509/private/m042.server.key
+
+  # request a server cert
+  openssl req -config /x509/openssl.cnf -passin pass:m042password \
+              -key /x509/private/m042.server.key \
+              -new -sha256 -out /x509/csr/m042.server.csr \
+              -subj "/C=US/ST=New York/L=New York City/O=University/OU=M042/CN=server.university.mongodb"
+
+  # sign the server cert
+  openssl ca -config /x509/openssl.cnf -extensions SAN \
+              -days 375 -notext -md sha256 -batch \
+              -in /x509/csr/m042.server.csr \
+              -out /x509/certs/m042.server.pem
+
+  # add the private key to the certificate
+  cat /x509/private/m042.server.key >> /x509/certs/m042.server.pem
+
+  # create private key/cert for clients
+  openssl genrsa -out /x509/private/m042.client.key 2048
+  chmod 400 /x509/private/m042.client.key
+
+  # request a client cert
+  openssl req -config /x509/openssl.cnf \
+              -key /x509/private/m042.client.key \
+              -new -sha256 -out /x509/csr/m042.client.csr \
+              -subj "/C=US/ST=New York/L=New York City/O=University/OU=M042/CN=client.university.mongodb"
+
+  # sign the client cert
+  openssl ca -config /x509/openssl.cnf -extensions SAN \
+              -days 375 -notext -md sha256 -batch \
+              -in /x509/csr/m042.client.csr \
+              -out /x509/certs/m042.client.pem
+
+  # add the private key to the certificate
+  cat /x509/private/m042.client.key >> /x509/certs/m042.client.pem
+
+  sudo chown vagrant:vagrant -R /x509
+
+  # create symbolic links
+  echo "linking certificates ..."
+
+  rm -rf /home/vagrant/certs
+  mkdir /home/vagrant/certs
+
+  ln -s /x509/certs/M042_CA.pem /home/vagrant/certs/M042_CA.pem
+  ln -s /x509/certs/m042.server.pem /home/vagrant/certs/server.pem
+  ln -s /x509/certs/m042.client.pem /home/vagrant/certs/client.pem
+}
+
+ip_config
+user_setup
+install_mongod
+# Starting at this point, it is only validations so removing exit on error
+verify_ip
+generate_certs
+set +e
+echo "
+Welcome to M042 Vagrant Box
+"
