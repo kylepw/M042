@@ -1,2 +1,2 @@
 .DS_Store
-*.vagrant/
+m042-vagrant-env/.*
